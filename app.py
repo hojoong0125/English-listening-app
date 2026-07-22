@@ -5,7 +5,7 @@ import os
 import random
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from itertools import islice
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -216,6 +216,7 @@ class SentenceItem:
     length_band: str
     source: str
     score: float
+    pronunciation_patterns: Optional[List[str]] = None
 
 
 def tokenize_words(text: str) -> List[str]:
@@ -610,16 +611,18 @@ def upsert_history_entry(history: List[dict], item: SentenceItem, accuracy: floa
     return history
 
 
-def get_due_review_candidates(history: List[dict]) -> List[dict]:
-    today = date.today()
-    threshold_map = {
-        1: 30,
-        3: 50,
-        7: 60,
-        15: 70,
-        30: 80,
-        60: 90,
-    }
+def get_due_review_candidates(history: List[dict], reference_date: Optional[date] = None) -> List[dict]:
+    reference_date = reference_date or date.today()
+    review_cycles = [
+        (1, 30),
+        (3, 50),
+        (7, 60),
+        (15, 70),
+        (30, 70),
+        (60, 70),
+        (120, 70),
+        (240, 70),
+    ]
     candidates = []
     for entry in history:
         created_at = entry.get("created_at")
@@ -629,12 +632,13 @@ def get_due_review_candidates(history: List[dict]) -> List[dict]:
             created_date = datetime.strptime(created_at, "%Y-%m-%d").date()
         except Exception:
             continue
-        days_passed = (today - created_date).days
         priority_score = float(entry.get("priority_score", 0.0))
         matching_cycle = None
-        for cycle_days, threshold in threshold_map.items():
-            if days_passed >= cycle_days and priority_score >= threshold:
+        for cycle_days, threshold in review_cycles:
+            due_date = created_date + timedelta(days=cycle_days)
+            if reference_date == due_date and priority_score >= threshold:
                 matching_cycle = cycle_days
+                break
         if matching_cycle is None:
             continue
         candidates.append({**entry, "cycle_days": matching_cycle})
@@ -677,6 +681,7 @@ def create_sentence_from_settings(
     api_key: str,
     model: str,
     mode: str,
+    reference_date: Optional[date] = None,
 ) -> Tuple[SentenceItem, str, str]:
     used = st.session_state.get("used_signatures", set())
     if source_mode == "OpenAI 실시간 생성":
@@ -688,9 +693,9 @@ def create_sentence_from_settings(
             st.session_state.openai_tip = tip
             return item, "openai", "OpenAI 모델로 새 문장을 생성했어요."
 
-    if mode == "망각곡선 스마트 복습 (1·3·7·15·30·60일)":
+    if mode == "망각곡선 스마트 복습 (1·3·7·15·30·60·120·240일)":
         history = load_history()
-        due_items = get_due_review_candidates(history)
+        due_items = get_due_review_candidates(history, reference_date=reference_date)
         if due_items:
             selected = due_items[0]
             item = SentenceItem(
@@ -777,9 +782,14 @@ with st.sidebar:
     )
     learning_mode = st.selectbox(
         "학습 모드",
-        ["실시간 딕테이션 (신규 학습)", "망각곡선 스마트 복습 (1·3·7·15·30·60일)"],
+        ["실시간 딕테이션 (신규 학습)", "망각곡선 스마트 복습 (1·3·7·15·30·60·120·240일)"],
         index=0 if st.session_state.current_mode == "실시간 딕테이션 (신규 학습)" else 1,
         key="learning_mode_select",
+    )
+    review_reference_date = st.date_input(
+        "복습 기준 날짜",
+        value=date.today(),
+        key="review_reference_date",
     )
 
     st.caption("OpenAI 실시간 생성 모드를 쓰려면 API 키를 입력하세요.")
@@ -796,10 +806,10 @@ with st.sidebar:
 
     st.divider()
     history = load_history()
-    due_candidates = get_due_review_candidates(history)
+    due_candidates = get_due_review_candidates(history, review_reference_date)
     st.caption(f"저장된 학습 기록: {len(history)}개")
     st.caption(f"현재 복습 큐: {len(due_candidates)}개")
-    st.write("복습 메뉴에서 우선순위가 높은 문장만 자동으로 다시 보여줍니다.")
+    st.write("선택한 날짜 기준으로 복습 대상 문장을 미리 확인할 수 있습니다.")
 
 
 if (
@@ -818,6 +828,7 @@ if (
             api_key=openai_api_key,
             model=openai_model,
             mode=learning_mode,
+            reference_date=review_reference_date,
         )
     st.session_state.current_item = item
     st.session_state.current_source_mode = source_mode
@@ -837,13 +848,33 @@ item: SentenceItem = st.session_state.current_item
 left, right = st.columns([1.15, 0.85], gap="large")
 
 with left:
+    st.markdown("### 날짜별 복습/기록 확인")
+    history = load_history()
+    due_candidates = get_due_review_candidates(history, review_reference_date)
+    if learning_mode == "망각곡선 스마트 복습 (1·3·7·15·30·60·120·240일)":
+        if due_candidates:
+            st.write(f"{review_reference_date} 기준 복습 큐")
+            for entry in due_candidates[:8]:
+                st.write(f"- {entry.get('english', '-')} | 점수 {entry.get('priority_score', 0.0):.1f} | {entry.get('cycle_days')}일차")
+        else:
+            st.info("이 날짜에는 복습 대상 문장이 없습니다.")
+    else:
+        st.caption("복습 모드에서만 날짜 기준 조회가 적용됩니다.")
+
+    if history:
+        st.markdown("#### 최근 학습 기록")
+        recent_history = sorted(history, key=lambda item: item.get("created_at", ""), reverse=True)[:8]
+        for entry in recent_history:
+            st.write(f"- {entry.get('created_at', '-')} | {entry.get('english', '-')}" )
+    else:
+        st.info("아직 저장된 학습 기록이 없습니다.")
     st.subheader("현재 문장")
     st.info(st.session_state.last_load_reason)
 
     meta_cols = st.columns(4)
     meta_cols[0].metric("난이도", item.difficulty)
     meta_cols[1].metric("길이", item.length_band)
-    meta_cols[2].metric("출처", "OpenAI" if "OpenAI" in item.source else ("복습" if learning_mode == "망각곡선 스마트 복습 (1·3·7·15·30·60일)" else "HF"))
+    meta_cols[2].metric("출처", "OpenAI" if "OpenAI" in item.source else ("복습" if learning_mode == "망각곡선 스마트 복습 (1·3·7·15·30·60·120·240일)" else "HF"))
     meta_cols[3].metric("점수", f"{item.score:.1f}")
 
     audio_bytes = make_tts_audio_bytes(item.english, "en")
@@ -963,7 +994,7 @@ if submit:
             st.write("- 1차 입력만 제출되었어요.")
 
     st.markdown("### 다음 액션")
-    if learning_mode == "망각곡선 스마트 복습 (1·3·7·15·30·60일)":
+    if learning_mode == "망각곡선 스마트 복습 (1·3·7·15·30·60·120·240일)":
         st.write("복습 모드로 다시 새 문장을 불러오면, 저장된 기록 기준으로 다음 복습 대상이 자동으로 선택됩니다.")
     else:
         st.write("사이드바에서 난이도나 길이를 바꾸고 새 문장을 불러오면 계속 연습할 수 있어요.")
