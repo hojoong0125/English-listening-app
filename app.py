@@ -577,8 +577,21 @@ def save_history(history: List[dict]) -> None:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
-def upsert_history_entry(history: List[dict], item: SentenceItem, accuracy: float, error_ratio: float) -> List[dict]:
+def upsert_history_entry(
+    history: List[dict],
+    item: SentenceItem,
+    accuracy: float,
+    error_ratio: float,
+    review_completed: bool = False,
+    review_reference_date: Optional[date] = None,
+) -> List[dict]:
     today = date.today().isoformat()
+    reference_date = review_reference_date or date.today()
+    reference_key = reference_date.isoformat()
+    completed_dates: List[str] = []
+    if review_completed:
+        completed_dates.append(reference_key)
+
     entry = {
         "english": item.english,
         "korean": item.korean,
@@ -593,6 +606,8 @@ def upsert_history_entry(history: List[dict], item: SentenceItem, accuracy: floa
         "last_accuracy": accuracy,
         "last_error_ratio": error_ratio,
         "priority_score": round(max(0.0, min(100.0, (error_ratio * 50) + 20)), 1),
+        "review_status": "completed" if completed_dates else "pending",
+        "review_completed_dates": completed_dates,
         "pronunciation_patterns": item.pronunciation_patterns or [],
     }
 
@@ -605,10 +620,55 @@ def upsert_history_entry(history: List[dict], item: SentenceItem, accuracy: floa
             existing["last_reviewed_at"] = today
             existing["review_count"] = existing.get("review_count", 0) + 1
             existing["priority_score"] = round(max(0.0, min(100.0, (existing.get("priority_score", 0.0) + entry["priority_score"]) / 2.0)), 1)
+
+            completed_dates_existing = existing.get("review_completed_dates")
+            if isinstance(completed_dates_existing, list):
+                completed_set = set(completed_dates_existing)
+            else:
+                completed_set = set()
+                if existing.get("review_status") == "completed":
+                    last_reviewed_at = existing.get("last_reviewed_at")
+                    if isinstance(last_reviewed_at, str) and last_reviewed_at:
+                        completed_set.add(last_reviewed_at)
+
+            if completed_dates:
+                completed_set.update(completed_dates)
+
+            existing["review_completed_dates"] = sorted(completed_set)
+            existing["review_status"] = "completed" if existing["review_completed_dates"] else "pending"
             return history
 
     history.append(entry)
     return history
+
+
+def annotate_review_queue(
+    entries: Sequence[dict],
+    active_english: Optional[str] = None,
+    reference_date: Optional[date] = None,
+) -> List[dict]:
+    reference_key = (reference_date or date.today()).isoformat()
+    annotated = []
+    for entry in entries:
+        completed_dates = entry.get("review_completed_dates")
+        completed_for_date = False
+        if isinstance(completed_dates, list):
+            completed_for_date = reference_key in completed_dates
+        elif entry.get("review_status") == "completed":
+            last_reviewed_at = entry.get("last_reviewed_at")
+            if isinstance(last_reviewed_at, str) and last_reviewed_at:
+                completed_for_date = last_reviewed_at == reference_key
+            else:
+                completed_for_date = True
+
+        if completed_for_date:
+            status = "복습 완료"
+        elif active_english and entry.get("english") == active_english:
+            status = "진행 중"
+        else:
+            status = "복습"
+        annotated.append({**entry, "queue_status": status})
+    return annotated
 
 
 def get_due_review_candidates(history: List[dict], reference_date: Optional[date] = None) -> List[dict]:
@@ -853,9 +913,15 @@ with left:
     due_candidates = get_due_review_candidates(history, review_reference_date)
     if learning_mode == "망각곡선 스마트 복습 (1·3·7·15·30·60·120·240일)":
         if due_candidates:
+            queue_entries = annotate_review_queue(
+                due_candidates,
+                active_english=item.english,
+                reference_date=review_reference_date,
+            )
             st.write(f"{review_reference_date} 기준 복습 큐")
-            for entry in due_candidates[:8]:
-                st.write(f"- {entry.get('english', '-')} | 점수 {entry.get('priority_score', 0.0):.1f} | {entry.get('cycle_days')}일차")
+            for entry in queue_entries[:8]:
+                status = entry.get("queue_status", "복습")
+                st.write(f"- [{status}] {entry.get('english', '-')} | 점수 {entry.get('priority_score', 0.0):.1f} | {entry.get('cycle_days')}일차")
         else:
             st.info("이 날짜에는 복습 대상 문장이 없습니다.")
     else:
@@ -955,7 +1021,15 @@ if submit:
     acc2, _, _ = calculate_accuracy(reference, attempt2)
     best_acc = max(acc1, acc2) if attempt1 or attempt2 else 0.0
     error_ratio = round(max(0.0, 1.0 - (best_acc / 100.0)), 3)
-    history = upsert_history_entry(history, item, best_acc, error_ratio)
+    review_completed = learning_mode == "망각곡선 스마트 복습 (1·3·7·15·30·60·120·240일)"
+    history = upsert_history_entry(
+        history,
+        item,
+        best_acc,
+        error_ratio,
+        review_completed=review_completed,
+        review_reference_date=review_reference_date,
+    )
     save_history(history)
 
     col_a, col_b = st.columns(2)
